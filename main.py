@@ -1,5 +1,7 @@
 import sys
 import os
+import subprocess
+from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QTextEdit, 
                              QPushButton, QVBoxLayout, QHBoxLayout, QLineEdit)
 from PyQt5.QtCore import Qt, QPoint, QTimer, QPropertyAnimation, QRect
@@ -154,6 +156,23 @@ class TetoCompanion(QWidget):
         self.chat_active = False
         self.conversation_history = []
         
+        self.known_processes = set()
+        # Timer para procesos
+        self.process_timer = QTimer(self)
+        self.process_timer.timeout.connect(self.check_processes)
+        self.process_timer.start(5000) # Cada 5 segundos
+        
+        # Variables para física de agitado
+        self.original_pixmap = None
+        self.current_scale = 1.0
+        self.shake_intensity = 0.0
+        self.last_global_pos = None
+        
+        # Timer de física (30 FPS aprox)
+        self.physics_timer = QTimer(self)
+        self.physics_timer.timeout.connect(self.update_physics)
+        self.physics_timer.start(33)
+        
         # IA
         self.teto_ai = TetoAI(use_gemini=False)  # Cambiar a True y agregar key para Gemini
         
@@ -187,10 +206,10 @@ class TetoCompanion(QWidget):
         sprite_path = os.path.join('sprites', 'idle', 'Sprite-0001.png')
         
         if os.path.exists(sprite_path):
-            pixmap = QPixmap(sprite_path)
-            self.sprite_label.setPixmap(pixmap)
-            self.setGeometry(100, 100, pixmap.width(), pixmap.height())
-            self.sprite_label.setGeometry(0, 0, pixmap.width(), pixmap.height())
+            self.original_pixmap = QPixmap(sprite_path)
+            self.sprite_label.setPixmap(self.original_pixmap)
+            self.setGeometry(100, 100, self.original_pixmap.width(), self.original_pixmap.height())
+            self.sprite_label.setGeometry(0, 0, self.original_pixmap.width(), self.original_pixmap.height())
             print(f"✓ Sprite cargado")
         else:
             print(f"✗ No se encontró el sprite")
@@ -203,6 +222,16 @@ class TetoCompanion(QWidget):
         print("- Click derecho: Menú/Cerrar")
         print("=============================\n")
         
+        # Saludo inicial
+        QTimer.singleShot(500, self.show_startup_greeting)
+
+    def show_startup_greeting(self):
+        """Muestra el saludo inicial con la hora"""
+        greeting = self.get_time_greeting()
+        self.speech_bubble.show_message(f"¡Hola! {greeting}")
+        self.update_bubble_position()
+        QTimer.singleShot(30000, self.speech_bubble.hide_message)
+            
     def mouseDoubleClickEvent(self, event):
         """Doble click para abrir/cerrar chat"""
         if event.button() == Qt.LeftButton:
@@ -212,6 +241,7 @@ class TetoCompanion(QWidget):
         if event.button() == Qt.LeftButton:
             self.dragging = True
             self.offset = event.pos()
+            self.last_global_pos = event.globalPos()
         elif event.button() == Qt.RightButton:
             # Por ahora solo cierra, después podés agregar menú contextual
             print("Cerrando...")
@@ -219,13 +249,58 @@ class TetoCompanion(QWidget):
             
     def mouseMoveEvent(self, event):
         if self.dragging:
-            self.move(event.globalPos() - self.offset)
+            curr_pos = event.globalPos()
+            self.move(curr_pos - self.offset)
+            
+            # Detectar agitado
+            if self.last_global_pos:
+                dist = (curr_pos - self.last_global_pos).manhattanLength()
+                # Aumentar intensidad si se mueve
+                self.shake_intensity += dist
+            
+            self.last_global_pos = curr_pos
+            
             self.update_bubble_position()
             self.update_chat_position()
             
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.dragging = False
+            self.last_global_pos = None
+
+    def update_physics(self):
+        """Actualiza el tamaño basado en el agitado"""
+        # Decaer intensidad
+        self.shake_intensity = max(0, self.shake_intensity * 0.9 - 10)
+        
+        # Calcular escala objetivo (1.0 a 1.5)
+        # 1000 de intensidad = +10% tamaño
+        target_scale = 1.0 + min(self.shake_intensity / 5000.0, 1.0)
+        
+        # Suavizar transición
+        if abs(target_scale - self.current_scale) > 0.001:
+            self.current_scale += (target_scale - self.current_scale) * 0.1
+            self.apply_scale()
+            
+    def apply_scale(self):
+        """Aplica la escala actual al sprite y ventana"""
+        if not self.original_pixmap:
+            return
+            
+        new_w = int(self.original_pixmap.width() * self.current_scale)
+        new_h = int(self.original_pixmap.height() * self.current_scale)
+        
+        if new_w != self.width() or new_h != self.height():
+            scaled_pixmap = self.original_pixmap.scaled(
+                new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.sprite_label.setPixmap(scaled_pixmap)
+            self.sprite_label.resize(new_w, new_h)
+            self.resize(new_w, new_h)
+            
+            # Actualizar posiciones de elementos adjuntos inmediatamente
+            self.update_bubble_position()
+            self.update_chat_position()
     
     def toggle_chat(self):
         """Abre/cierra el chat"""
@@ -243,8 +318,20 @@ class TetoCompanion(QWidget):
             
             # Mensaje de bienvenida
             if not self.conversation_history:
-                self.speech_bubble.show_message("¡Hola! ¿Qué querés?\nEscribí /help para ver comandos")
+                greeting = self.get_time_greeting()
+                self.speech_bubble.show_message(f"{greeting} ¿Qué querés?\nEscribí /help para ver comandos")
                 self.update_bubble_position()
+    
+    def get_time_greeting(self):
+        """Devuelve un saludo basado en la hora del día"""
+        hour = datetime.now().hour
+        
+        if 6 <= hour < 12:
+            return "¡Buenos días!"
+        elif 12 <= hour < 20:
+            return "¡Buenas tardes!"
+        else:
+            return "¡Buenas noches!"
     
     def update_bubble_position(self):
         """Actualiza la posición del globito (arriba de Teto)"""
@@ -335,7 +422,53 @@ class TetoCompanion(QWidget):
         """Al cerrar la ventana principal"""
         self.speech_bubble.close()
         self.chat_panel.close()
+        
+        # Cerrar Ollama si se usó (prioritario)
+        if not self.teto_ai.use_gemini:
+            print("Cerrando Ollama...")
+            try:
+                subprocess.run('taskkill /F /IM ollama.exe', shell=True, stderr=subprocess.DEVNULL)
+                subprocess.run('taskkill /F /IM "ollama app.exe"', shell=True, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"Error cerrando Ollama: {e}")
+        
         event.accept()
+
+    def check_processes(self):
+        """Revisa procesos nuevos"""
+        try:
+            # Obtener lista de procesos usando tasklist
+            output = subprocess.check_output('tasklist /FO CSV /NH', shell=True).decode('utf-8', errors='ignore')
+            current_processes = set()
+            
+            for line in output.splitlines():
+                if '"' in line:
+                    # El formato es "Image Name","PID",...
+                    proc_name = line.split('","')[0].replace('"', '').lower()
+                    current_processes.add(proc_name)
+            
+            # Detectar nuevos procesos (si no es la primera vez)
+            if self.known_processes:
+                new_procs = current_processes - self.known_processes
+                
+                for proc in new_procs:
+                    if proc in ['code.exe', 'chimera.exe', 'steam.exe', 'discord.exe']:
+                         print(f"👀 Teto vió que abriste: {proc}")
+
+                if 'code.exe' in new_procs:
+                    self.speech_bubble.show_message("¡Oh! ¿Vas a programar?\n¡Espero que no rompas nada!")
+                    self.update_bubble_position()
+                    QTimer.singleShot(5000, self.speech_bubble.hide_message)
+                
+                # Ejemplo extra: navegador
+                elif 'chrome.exe' in new_procs and 'chrome.exe' not in self.known_processes:
+                    # Chrome abre muchos procesos, evitar spam
+                    pass 
+                    
+            self.known_processes = current_processes
+            
+        except Exception as e:
+            print(f"Error monitoreando procesos: {e}")
 
 
 if __name__ == '__main__':
