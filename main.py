@@ -1,13 +1,106 @@
 import sys
 import os
 import subprocess
+import speech_recognition as sr
+import threading
+import pyaudio
+from pynput import keyboard
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QTextEdit, 
                              QPushButton, QVBoxLayout, QHBoxLayout, QLineEdit)
-from PyQt5.QtCore import Qt, QPoint, QTimer, QPropertyAnimation, QRect
+from PyQt5.QtCore import Qt, QPoint, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap, QFont
 from ai_service import TetoAI
 from tts_service import TetoTTS
+
+class SubtitleOverlay(QWidget):
+    """Subtítulos flotantes para mostrar lo que escucha"""
+    def __init__(self):
+        super().__init__()
+        # Importante: WindowTransparentForInput permite clickear a través, pero no si queremos moverlo.
+        # Quitamos WindowTransparentForInput para que se vea claro, o lo dejamos si es solo overlay.
+        # El usuario quiere VERLO, así que aseguramos que esté TopMost.
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        
+        layout = QVBoxLayout()
+        self.label = QLabel("")
+        self.label.setStyleSheet("""
+            QLabel {
+                color: #ffff00; /* Amarillo para contraste */
+                font-size: 20px;
+                font-weight: bold;
+                background-color: rgba(0, 0, 0, 180);
+                padding: 15px;
+                border-radius: 10px;
+                border: 2px solid white;
+            }
+        """)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setWordWrap(True)
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+        
+        # Posicionar
+        self.update_position()
+        
+    def update_position(self):
+        screen = QApplication.primaryScreen().geometry()
+        # Ancho 80% de la pantalla, centrado abajo
+        w = int(screen.width() * 0.8)
+        h = 100
+        x = (screen.width() - w) // 2
+        y = screen.height() - h - 50 
+        self.setGeometry(x, y, w, h)
+        
+    def set_text(self, text):
+        self.label.setText(text)
+        self.update_position()
+        self.show()
+        self.raise_() # Traer al frente
+        
+    def clear(self):
+        self.hide()
+
+class AIWorker(QThread):
+
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    
+    def __init__(self, teto_ai, message, history):
+        super().__init__()
+        self.teto_ai = teto_ai
+        self.message = message
+        self.history = history
+        
+    def run(self):
+        try:
+            response = self.teto_ai.chat(self.message, conversation_history=self.history)
+            self.finished.emit(response)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class VoiceWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    
+    def __init__(self, audio_data):
+        super().__init__()
+        self.audio_data = audio_data
+    
+    def run(self):
+        r = sr.Recognizer()
+        try:
+            # Usar el audio raw capturado
+            text = r.recognize_google(self.audio_data, language="es-AR")
+            print(f"🎤 Reconocido: {text}")
+            self.finished.emit(text)
+        except sr.UnknownValueError:
+            self.error.emit("No entendí...")
+        except Exception as e:
+            self.error.emit(f"Error voz: {e}")
+
 
 class SpeechBubble(QWidget):
     """Globo de diálogo que aparece arriba de Teto"""
@@ -29,14 +122,21 @@ class SpeechBubble(QWidget):
             }
         """)
         self.label.setWordWrap(True)
-        self.label.setMaximumWidth(300)
-        self.label.setMinimumWidth(100)
         self.hide()
         
     def show_message(self, text):
-        """Muestra un mensaje en el globito"""
+        """Muestra un mensaje en el globito con ajuste dinámico"""
         self.label.setText(text)
+        
+        # Calcular tamaño cuadrado ideal
+        # Aproximación: sqrt(caracteres * factor)
+        chars = len(text)
+        ideal_width = int((chars * 10) ** 0.5 * 10)
+        ideal_width = max(100, min(ideal_width, 300))
+        
+        self.label.setFixedWidth(ideal_width)
         self.label.adjustSize()
+        
         self.resize(self.label.width() + 10, self.label.height() + 10)
         self.label.move(5, 5)
         self.show()
@@ -96,6 +196,24 @@ class ChatPanel(QWidget):
         button_layout = QHBoxLayout()
         button_layout.setSpacing(5)
         
+        self.mic_button = QPushButton("🎤")
+        self.mic_button.setFixedSize(40, 35)
+        self.mic_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a4a;
+                color: white;
+                border: 2px solid #ff69b4;
+                border-radius: 8px;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: #666666;
+            }
+            QPushButton:pressed {
+                background-color: #ff69b4;
+            }
+        """)
+
         self.send_button = QPushButton("Enviar")
         self.send_button.setStyleSheet("""
             QPushButton {
@@ -134,6 +252,7 @@ class ChatPanel(QWidget):
             }
         """)
         
+        button_layout.addWidget(self.mic_button)
         button_layout.addWidget(self.send_button)
         button_layout.addWidget(self.close_button)
         
@@ -167,6 +286,7 @@ class TetoCompanion(QWidget):
         self.current_scale = 1.0
         self.shake_intensity = 0.0
         self.last_global_pos = None
+        self.hold_timer = 0
         
         # Timer de física (30 FPS aprox)
         self.physics_timer = QTimer(self)
@@ -174,10 +294,10 @@ class TetoCompanion(QWidget):
         self.physics_timer.start(33)
         
         # IA
-        self.teto_ai = TetoAI(use_gemini=False)  # Cambiar a True y agregar key para Gemini
+        self.teto_ai = TetoAI(use_gemini=False)
         
         # TTS
-        self.tts = TetoTTS(voice="es-AR-ElenaNeural")  # Voz argentina femenina
+        self.tts = TetoTTS(voice="es-AR-ElenaNeural")
         
         # Globito de diálogo
         self.speech_bubble = SpeechBubble()
@@ -187,8 +307,97 @@ class TetoCompanion(QWidget):
         self.chat_panel.input_field.returnPressed.connect(self.send_message)
         self.chat_panel.send_button.clicked.connect(self.send_message)
         self.chat_panel.close_button.clicked.connect(self.toggle_chat)
+        self.chat_panel.mic_button.clicked.connect(self.toggle_voice_input)
+        
+        # Subtítulos
+        self.subtitles = SubtitleOverlay()
+        
+        # Audio PTT
+        self.is_recording = False
+        self.audio_frames = []
+        self.pyaudio_instance = pyaudio.PyAudio()
+        self.stream = None
         
         self.init_ui()
+
+    def keyPressEvent(self, event):
+        """PTT cuando se presiona O"""
+        if event.key() == Qt.Key_O and not event.isAutoRepeat() and not self.is_recording:
+            self.start_recording()
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """PTT cuando se suelta O"""
+        if event.key() == Qt.Key_O and not event.isAutoRepeat() and self.is_recording:
+            self.stop_recording()
+        super().keyReleaseEvent(event)
+
+            
+    def start_recording(self):
+        print("🎤 Iniciando grabación PTT...")
+        self.is_recording = True
+        self.audio_frames = []
+        
+        # Feedback visual
+        QTimer.singleShot(0, lambda: self.subtitles.set_text("🎤 Escuchando..."))
+        
+        # Abrir stream
+        try:
+            self.stream = self.pyaudio_instance.open(format=pyaudio.paInt16,
+                                                   channels=1,
+                                                   rate=44100,
+                                                   input=True,
+                                                   frames_per_buffer=1024)
+            
+            # Grabar en hilo aparte para no bloquear
+            threading.Thread(target=self.record_loop).start()
+            
+        except Exception as e:
+            print(f"Error abriendo mic: {e}")
+            self.is_recording = False
+
+    def record_loop(self):
+        while self.is_recording and self.stream:
+            try:
+                data = self.stream.read(1024)
+                self.audio_frames.append(data)
+            except:
+                break
+
+    def stop_recording(self):
+        print("🎤 Deteniendo grabación...")
+        self.is_recording = False
+        
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+            self.stream = None
+            
+        # Convertir a AudioData de SpeechRecognition
+        raw_data = b''.join(self.audio_frames)
+        audio_data = sr.AudioData(raw_data, 44100, 2)
+        
+        # Procesar
+        QTimer.singleShot(0, lambda: self.subtitles.set_text("⏳ Procesando..."))
+        self.process_voice(audio_data)
+
+    def process_voice(self, audio_data):
+        self.voice_worker = VoiceWorker(audio_data)
+        self.voice_worker.finished.connect(self.handle_voice_result)
+        self.voice_worker.error.connect(self.handle_voice_error)
+        self.voice_worker.start()
+
+    def handle_voice_result(self, text):
+        self.subtitles.set_text(f"🗣 \"{text}\"")
+        QTimer.singleShot(3000, self.subtitles.clear)
+        
+        # Enviar al chat
+        self.chat_panel.input_field.setText(text)
+        self.send_message()
+
+    def handle_voice_error(self, error):
+        self.subtitles.set_text(f"❌ {error}")
+        QTimer.singleShot(2000, self.subtitles.clear)
         
     def init_ui(self):
         # Ventana sin bordes, siempre arriba, fondo transparente
@@ -270,12 +479,33 @@ class TetoCompanion(QWidget):
 
     def update_physics(self):
         """Actualiza el tamaño basado en el agitado"""
-        # Decaer intensidad
-        self.shake_intensity = max(0, self.shake_intensity * 0.9 - 10)
         
-        # Calcular escala objetivo (1.0 a 1.5)
-        # 1000 de intensidad = +10% tamaño
-        target_scale = 1.0 + min(self.shake_intensity / 5000.0, 1.0)
+        # Si estamos en espera (teto gigante)
+        if self.hold_timer > 0:
+            self.hold_timer -= 33
+            # Mantener intensidad al tope para que no se achique
+            self.shake_intensity = 6000
+            target_scale = 3.0
+            
+            if self.hold_timer <= 0:
+                self.hold_timer = 0
+                
+        else:
+            # Decaer intensidad (un poco más lento para que sea más fácil mantener)
+            self.shake_intensity = max(0, self.shake_intensity * 0.95 - 10)
+            
+            # Calcular escala objetivo (1.0 a 3.0)
+            # Ahora es más sensible para llegar a x3
+            target_scale = 1.0 + min(self.shake_intensity / 3000.0, 2.0)
+            
+            # Si llegamos al máximo, activamos el timer de espera
+            if target_scale >= 3.0:
+                target_scale = 3.0
+                self.hold_timer = 3000 # 3 segundos de espera
+                # Feedback visual opcional
+                self.speech_bubble.show_message("¡WAAAAH! 💢")
+                self.update_bubble_position()
+                QTimer.singleShot(2000, self.speech_bubble.hide_message)
         
         # Suavizar transición
         if abs(target_scale - self.current_scale) > 0.001:
@@ -347,76 +577,125 @@ class TetoCompanion(QWidget):
             chat_y = self.y() + self.height() + 10
             self.chat_panel.move(chat_x, chat_y)
     
+    
     def send_message(self):
-        """Envía mensaje a Teto"""
+        """Envía mensaje a Teto (Async)"""
         message = self.chat_panel.input_field.text().strip()
         if not message:
             return
         
         self.chat_panel.input_field.clear()
         
-        # Comandos especiales
-        if message == '/help':
-            help_text = self.teto_ai.get_help()
-            self.speech_bubble.show_message(help_text)
-            self.update_bubble_position()
+        # Comandos especiales (síncronos)
+        if message.startswith('/'):
+            self.handle_command(message)
             return
-        
-        if message == '/memoria':
-            memory_text = self.teto_ai.get_memory_summary()
-            self.speech_bubble.show_message(memory_text)
-            self.update_bubble_position()
-            return
-        
-        if message == '/olvidar':
-            result = self.teto_ai.clear_all_memory()
-            self.conversation_history = []
-            self.speech_bubble.show_message(result)
-            self.update_bubble_position()
-            return
-        
-        # Deshabilitar botón mientras piensa
+
+        # Deshabilitar UI
         self.chat_panel.send_button.setEnabled(False)
+        self.chat_panel.input_field.setEnabled(False)
+        self.chat_panel.mic_button.setEnabled(False)
         self.chat_panel.send_button.setText("...")
         
         # Mostrar que está pensando
-        self.speech_bubble.show_message("🤔")
+        self.speech_bubble.show_message("🤔 Pensando...")
         self.update_bubble_position()
         
-        # Procesar con la IA (de forma síncrona por ahora)
-        QApplication.processEvents()  # Para que se actualice la UI
+        # Agregar mensaje al historial
+        self.conversation_history.append({"role": "user", "content": message})
         
-        try:
-            # Agregar mensaje al historial
-            self.conversation_history.append({
-                "role": "user",
-                "content": message
-            })
+        # Iniciar Worker
+        self.ai_worker = AIWorker(self.teto_ai, message, self.conversation_history)
+        self.ai_worker.finished.connect(self.handle_ai_response)
+        self.ai_worker.error.connect(self.handle_ai_error)
+        self.ai_worker.start()
+
+    def handle_command(self, command):
+        """Maneja comandos slash"""
+        if command == '/help':
+            text = self.teto_ai.get_help()
+        elif command == '/memoria':
+            text = self.teto_ai.get_memory_summary()
+        elif command == '/olvidar':
+            text = self.teto_ai.clear_all_memory()
+            self.conversation_history = []
+        else:
+            text = "Comando desconocido"
             
-            # Obtener respuesta
-            response = self.teto_ai.chat(message, conversation_history=self.conversation_history)
-            
-            # Agregar respuesta al historial
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": response
-            })
-            
-            # Mostrar respuesta
-            self.speech_bubble.show_message(response)
-            self.update_bubble_position()
-            
-            # Hacer que hable (no bloqueante)
-            self.tts.speak(response, blocking=False)
-            
-        except Exception as e:
-            self.speech_bubble.show_message(f"Error: {str(e)}")
-            self.update_bubble_position()
-        
-        # Reactivar botón
+        self.speech_bubble.show_message(text)
+        self.update_bubble_position()
+
+    def handle_ai_response(self, response):
+        """Maneja respuesta exitosa de la IA"""
+        # UI Release
         self.chat_panel.send_button.setEnabled(True)
+        self.chat_panel.input_field.setEnabled(True)
+        self.chat_panel.mic_button.setEnabled(True)
         self.chat_panel.send_button.setText("Enviar")
         self.chat_panel.input_field.setFocus()
+        
+        # Historial
+        self.conversation_history.append({"role": "assistant", "content": response})
+        
+        # Mostrar y hablar
+        self.speech_bubble.show_message(response)
+        self.update_bubble_position()
+        self.tts.speak(response, blocking=False)
+        
+    def handle_ai_error(self, error):
+        """Maneja error de la IA"""
+        self.chat_panel.send_button.setEnabled(True)
+        self.chat_panel.input_field.setEnabled(True)
+        self.chat_panel.mic_button.setEnabled(True)
+        self.chat_panel.send_button.setText("Enviar")
+        
+        self.speech_bubble.show_message(f"Error: {error}")
+        self.update_bubble_position()
+
+    def toggle_voice_input(self):
+        """Maneja la entrada de voz"""
+        self.chat_panel.mic_button.setEnabled(False)
+        self.chat_panel.input_field.setPlaceholderText("Escuchando...")
+        self.chat_panel.mic_button.setStyleSheet("background-color: #ff0000; border-radius: 8px;")
+        
+        self.voice_worker = VoiceWorker()
+        self.voice_worker.listening.connect(lambda: self.speech_bubble.show_message("👂 Te escucho..."))
+        self.voice_worker.finished.connect(self.handle_voice_result)
+        self.voice_worker.error.connect(self.handle_voice_error)
+        self.voice_worker.start()
+        
+    def handle_voice_result(self, text):
+        self.speech_bubble.hide_message()
+        self.chat_panel.input_field.setPlaceholderText("Escribile a Teto...")
+        self.chat_panel.mic_button.setEnabled(True)
+        self.chat_panel.mic_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a4a;
+                color: white;
+                border: 2px solid #ff69b4;
+                border-radius: 8px;
+                font-size: 16px;
+            }
+        """)
+        
+        # Escribir y enviar
+        self.chat_panel.input_field.setText(text)
+        self.send_message()
+
+    def handle_voice_error(self, error):
+        self.chat_panel.input_field.setPlaceholderText("Escribile a Teto...")
+        self.chat_panel.mic_button.setEnabled(True)
+        self.chat_panel.mic_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a4a;
+                color: white;
+                border: 2px solid #ff69b4;
+                border-radius: 8px;
+                font-size: 16px;
+            }
+        """)
+        self.speech_bubble.show_message(error)
+        self.update_bubble_position()
     
     def closeEvent(self, event):
         """Al cerrar la ventana principal"""

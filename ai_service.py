@@ -11,6 +11,10 @@ except ImportError:
 from datetime import datetime
 import json
 import os
+import subprocess
+import time
+import requests
+from requests.exceptions import ConnectionError
 
 class TetoAI:
     def __init__(self, use_gemini=False, gemini_key=None, memory_file="teto_memory.json"):
@@ -35,10 +39,44 @@ Recordás cosas importantes sobre el usuario y las usás en la conversación de 
             self.gemini_model = genai.GenerativeModel('gemini-pro')
             print("✓ Gemini API configurada")
         else:
+            self.ensure_ollama_running()
             print("✓ Usando Ollama local")
         
         if self.long_term_memory:
             print(f"✓ Memoria cargada: {len(self.long_term_memory)} datos")
+
+    def ensure_ollama_running(self):
+        """Verifica que Ollama esté corriendo, si no, lo inicia"""
+        print("⏳ Verificando servicio de Ollama...")
+        try:
+            # Intento rápido de conexión
+            ollama.list()
+            return True
+        except Exception:
+            print("⚠ Ollama no responde. Intentando iniciar...")
+            
+            # Iniciar proceso en background
+            try:
+                # Usamos subprocess.Popen para no bloquear
+                subprocess.Popen(["ollama", "serve"], 
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                
+                # Esperar a que levante (max 10 segundos)
+                for i in range(10):
+                    time.sleep(1)
+                    try:
+                        ollama.list()
+                        print("✓ Ollama iniciado correctamente")
+                        return True
+                    except:
+                        print(f"   ...esperando ({i+1}/10)")
+                        
+            except Exception as e:
+                print(f"✗ Falló el inicio de Ollama: {e}")
+                return False
+
     
     def load_memory(self):
         """Carga solo las keywords desde archivo"""
@@ -164,10 +202,21 @@ Recordás cosas importantes sobre el usuario y las usás en la conversación de 
         
         messages.append({"role": "user", "content": user_message})
         
-        response = ollama.chat(
-            model='llama3.1:8b',  # Llama 3.1 8B - estable y bueno
-            messages=messages
-        )
+        try:
+            response = ollama.chat(
+                model='llama3.1:8b',  # Llama 3.1 8B - estable y bueno
+                messages=messages
+            )
+        except (ConnectionError, Exception) as e:
+            print(f"⚠ Error de conexión con Ollama ({e}). Intentando reinicio...")
+            if self.ensure_ollama_running():
+                # Reintentar una vez
+                response = ollama.chat(
+                    model='llama3.1:8b',
+                    messages=messages
+                )
+            else:
+                raise e
         
         return response['message']['content']
     
